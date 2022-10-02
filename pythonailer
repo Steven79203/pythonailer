@@ -1,0 +1,268 @@
+#!/usr/bin/python 
+
+#<>-<> Pythonailer 1.0 <>-<>#
+""" TODO
+ 1 - Get the files as arguments. Verify if any paramether was inserted and see if valid files were added [DONE]
+ 
+ 2.1 - Make a montage of the thumbnails. Also check if there's already a previously generated thumbnail mosaic [DONE]
+ 2.2 - Repeat for each file [DONE
+ 
+ 3.1 - Recursive processing
+ 3.2 - Multithreaded [WORK IN PROGRESS]
+ 3.3 - Hardware acceleration (vaapi, vdpau)
+ 3.4 - Get arguments from command line for convenience [DONE]
+
+ 3.5 -- Reimplement using internal Python libraries - The currently implementation sucks and isn't portable
+"""
+""" BUG
+ Some files are passing through special character strip and are breaking the script [FIXED, FOR NOW...]
+ Montage file description is misinterpreting new line on space character [FIXED, FOR NOW...]
+"""
+
+import re, os, subprocess, shutil
+from optparse import OptionParser
+
+from multiprocessing import Pool
+from pymediainfo import MediaInfo as MI
+
+# Working directory - CONST
+CWD = os.getcwd()
+# Tmp dir
+TMPDIR = './tmp'
+
+# This is a lesser mess, but still!
+# subprocess line templates
+convert_templ = """
+convert {tmpdir}/{medianame}.tmp.jpg \
+    -background black -fill white \
+    -pointsize {psize} label:"{title}" \
+    -gravity NorthWest +swap -append ./screenlists/{medianame}.preview.jpg
+    """    
+ffmpeg_templ = """
+ffmpegthumbnailer -q 8 -s {width} \
+    -t {timestamp} -i {inputfile} \
+    -o {tmpdir}/{timestamp}.jpg
+    """
+sub_templ = """
+convert {tmpdir}/{timestamp}.jpg \
+    -fill '#0008' -draw 'rectangle {x1},{y1},{x2},{y2}' \
+    -fill white -pointsize {psize} -annotate +{z1}+{k1} '{timestamp}' \
+    {tmpdir}/{timestamp}.jpg
+    """
+montage_templ = """
+montage {tmpdir}/* \
+    -background black -pointsize 25 \
+    -tile 5x -geometry +2+4 {tmpdir}/{filename}.tmp.jpg
+    """
+
+# Returns a formatted timestamp HH:MM:SS
+def getFTime(duration):
+    duration/=1000
+    return "{:0>2d}:{:0>2d}:{:0>2d}".format(
+            int(duration//3600), 
+            int((duration%3600)//60), 
+            int(((duration%3600)%60)))
+
+# Returns percentage of the timestamp (secs) - DEPRECATED
+def getTimeStamp(tt,perc):
+    return tt*(perc/100)
+
+# Command line options
+def getParams():
+    parser = OptionParser()
+    parser.add_option("-w","--width",dest='TW',help="Thumbnails width (px). Default=300",metavar="TW")
+    parser.add_option("-n","--nthumbs",dest='NTHUMBS',help="Nº of thumbnails per image. Default=30",metavar="NTHUMBS") 
+    parser.add_option("-c","--cpus",dest="NCPUS",help="Nº of threads to use. Default=All threads",metavar="NCPUS")
+    parser.add_option("-o","--overwrite",dest="OVERW",help="Set 1 to overwrite all thumbnails already builded",metavar="OVERW")
+
+    return parser.parse_args()
+
+# FFMPEGthumbnailer process
+def ffmpegProcess(ss):
+    tstamp = getFTime(ss)
+
+    # ffmpegthumbnailer
+    subprocess.call(
+            ffmpeg_templ.format(
+                tmpdir    = TMPDIR,
+                width     = TW,
+                timestamp = tstamp,
+                inputfile = file
+            ),shell=True)
+
+    # Insert foot timestamp
+    subprocess.call(
+            sub_templ.format(
+                tmpdir    = TMPDIR, 
+                timestamp = tstamp,
+                x1 = TW, y1 = hi,
+                x2 = 0,  y2 = hf,
+                psize = ps,
+                z1 = 2, k1 = ly 
+            ),shell=True)
+
+# Generate the thumbnail preview
+def genThumbnails(data,options):
+    
+    global TW
+    TW = 300 if options.TW == None else int(options.TW)
+
+    # Screenlists directory
+    screendir = os.path.join(CWD,'screenlists')
+    if not os.path.isdir(screendir):
+        os.mkdir(screendir)
+
+    nfiles = len(data.items())
+    concord = 'files'
+
+    if nfiles == 1:
+        concord = 'file'
+    print("\n\033[1m\033[32m> Processing {} {} \n".format(nfiles,concord))
+
+    # Check for existing tmpdir
+    if not os.path.exists(TMPDIR):
+        pass
+    else:
+        if not os.listdir(TMPDIR) == 0:
+            shutil.rmtree(TMPDIR)
+        
+    title_templ = 'File:\ {filename}\\nLength:\ {duration}\\nSize:\ {size:0.2f}MiB\\nRes:\ {width}x{height}'
+
+    # Set number of processes
+    prcss = os.cpu_count() if options.NCPUS == None else int(options.NCPUS)
+    nthumbs = 30 if options.NTHUMBS == None else int(options.NTHUMBS)
+    
+    global file
+    for file,metas in data.items():
+        print('\033[1m\033[34m:: Processing file --> ', file, end=' ')
+        
+        # Escaping quotes, spaces and other characters that 
+        # might give problems with unusual file names on shell.
+        # There must be an easier and better way to do it...
+        file = re.sub(r'[^a-zA-Z0-9_-]','\\\\\g<0>',file)
+        
+        # Creating tmp dir for thumbs
+        os.mkdir(TMPDIR)
+        
+        # TODO - Allow to specify thumbnail width as script argument
+        # Parameters for timestamp subtitle box
+        global hi, hf, ly, ps
+        hi = int(TW/float(metas["ratio"]))  
+        hf = 0.9*hi                              
+        ly = hi - 2                             
+        ps = 0.1*hi
+
+        dur = metas["duration"]
+        
+        delta = int(dur/nthumbs)
+        
+        ssu = [delta*((2*i-1)/2) for i in range(1,nthumbs+1)] 
+        
+        with Pool(prcss) as p:
+            p.map(ffmpegProcess,ssu)
+        
+        # Montage's title
+        title = title_templ.format(
+            filename = file,
+            duration = getFTime(dur),
+            size     = (metas["size"]/(1024**2)),
+            width    = metas["width"],
+            height   = metas["height"])
+
+        # Building thumbnail montage
+        subprocess.call(
+                   montage_templ.format(filename = file, tmpdir = TMPDIR),shell=True)
+
+        # Inserting head informations
+        subprocess.call(
+                convert_templ.format(
+                    tmpdir     = TMPDIR,
+                    medianame  = file,
+                    psize      = 0.08*TW,
+                    title      = title),
+                shell=True)
+
+        # Remove temporary directory
+        shutil.rmtree(TMPDIR)
+        print('Done\033[m')
+    
+    # Move preview files to screenlists directory 
+    # Check if it doesn't exist already
+
+# Get file mediainfo
+def getMeta(videos):
+    metas = dict()
+    for file in videos:
+        generalinf = MI.parse(file).general_tracks[0]
+        videoinf  = MI.parse(file).video_tracks[0]
+        
+        metas.update({
+            file:{
+            "title"       : generalinf.title,
+            "size"        : generalinf.file_size,
+            "ratio"       : videoinf.display_aspect_ratio,
+            "duration"    : generalinf.duration,
+            "width"       : videoinf.width,
+            "height"      : videoinf.height
+        }})
+    return metas
+
+# Check for the right file extension and if it exists
+# Also checks for already builded thumbnails 
+def checkFiles(overw,files):
+    if len(files) > 0:
+        videos = list()        
+        pattern = r'.*\.(mp4|avi|mkv|flv|wmv|webm)$'
+        
+        for media in files:
+            if not os.path.exists(media):
+                continue
+            try:
+                video = re.search(pattern,media).group()
+            except AttributeError:
+                continue
+
+            # if not opt.OVERW == '1':
+            if not overw == '1':
+                prwfile = "screenlists/{}.preview.jpg".format(video)
+                if os.path.isfile(os.path.join(CWD,prwfile)):
+                    msg = '\033[1mPreview image for file {} already build.\nOverwrite it? [Y/N]\033[m:'
+                    opt = input(msg.format(media))
+                    if not opt in 'Yy':
+                        continue
+
+            videos.append(video)
+        
+        if len(videos) > 0:
+            return videos
+
+    return False
+
+# Main function
+def main():
+    os.system('clear')
+    print('\033[1m\033[33m)[][][][ PYTHON\033[34mAILER ][][][](\033[m\n')
+ 
+    opt, args = getParams() 
+
+    #with Pool(opt.NCPUS) as p:
+    #   p.map(checkFiles,args)
+
+    # Checking files 
+    videos = checkFiles(opt.OVERW,args)
+    if not videos:
+        print('\n\033[1m\033[31m> Empty arguments or invalid files. Exiting\033[m')
+        exit()
+    
+    # with Pool(opt.NCPUS) as p:
+    #   p.map(getMeta,videos)
+
+    # Mounting thumbnails
+    genThumbnails(getMeta(videos),opt)
+
+    print('\n\033[1m\033[32m> Jobs finished. Exiting...\033[m') 
+
+# EXECUTE!!
+if __name__ == '__main__':
+    main()
+
